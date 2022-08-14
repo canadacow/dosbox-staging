@@ -53,24 +53,63 @@ ScalerLineHandler_t RENDER_DrawLine;
 
 static void RENDER_CallBack(GFX_CallBackFunctions_t function);
 
+float s_SDRWhiteLevel = 0.0f;
+
 static void GetDisplayValues()
 {
-	UINT32 numPaths;
-	UINT32 numModes;
 	std::vector<DISPLAYCONFIG_PATH_INFO> paths;
 	std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-	do {
-		result = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths,
-			&numModes);
-		if (result != ERROR_SUCCESS) {
-			return {};
-		}
-		// allocate the recommended amount of space
-		paths.resize(numPaths);
-		modes.resize(numModes);
+	UINT32 flags = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
+	LONG result = ERROR_SUCCESS;
 
-		result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
-			&numModes, modes.data(), NULL);
+	do
+	{
+		// Determine how many path and mode structures to allocate
+		UINT32 pathCount, modeCount;
+		result = GetDisplayConfigBufferSizes(flags, &pathCount, &modeCount);
+
+		if (result != ERROR_SUCCESS)
+		{
+			return;
+		}
+
+		// Allocate the path and mode arrays
+		paths.resize(pathCount);
+		modes.resize(modeCount);
+
+		// Get all active paths and their modes
+		result = QueryDisplayConfig(flags, &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
+
+		// The function may have returned fewer paths/modes than estimated
+		paths.resize(pathCount);
+		modes.resize(modeCount);
+
+		// It's possible that between the call to GetDisplayConfigBufferSizes and QueryDisplayConfig
+		// that the display state changed, so loop on the case of ERROR_INSUFFICIENT_BUFFER.
+	} while (result == ERROR_INSUFFICIENT_BUFFER);
+
+	if (result != ERROR_SUCCESS)
+	{
+		return;
+	}
+
+	// For each active path
+	for (auto& path : paths)
+	{
+		DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel{};
+		whiteLevel.header.adapterId = path.targetInfo.adapterId;
+		whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+		whiteLevel.header.size = sizeof(whiteLevel);
+		whiteLevel.header.id = path.targetInfo.id;
+
+		result = DisplayConfigGetDeviceInfo(&whiteLevel.header);
+
+		if (result != ERROR_SUCCESS)
+		{
+			return;
+		}
+
+		s_SDRWhiteLevel = (float)whiteLevel.SDRWhiteLevel / 1000.0f;
 	}
 }
 
@@ -121,7 +160,8 @@ static float sRgbToScRgb(float val)
 
 static uint16_t UNORMToHalf(uint8_t unorm)
 {
-	return fp16_ieee_from_fp32_value(sRgbToScRgb(sRgbToLinear(unorm)));
+	float val = sRgbToScRgb(unormToFloat(unorm)) * s_SDRWhiteLevel;
+	return fp16_ieee_from_fp32_value(val);
 }
 
 static HalfFloat Convert32BitsToHalf(uint8_t r, uint8_t g, uint8_t b)
@@ -1387,6 +1427,8 @@ void RENDER_Init(Section *sec)
 {
 	Section_prop *section = static_cast<Section_prop *>(sec);
 	assert(section);
+
+	GetDisplayValues();
 
 	// For restarting the renderer
 	static auto running = false;
