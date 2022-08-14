@@ -31,9 +31,10 @@ Bitu Scaler_ChangedLineIndex;
 
 static union {
 	 //The +1 is a at least for the normal scalers not needed. (-1 is enough)
-	uint32_t b32 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
-	uint16_t b16 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
-	uint8_t   b8 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
+	HalfFloat b64 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
+	uint32_t  b32 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
+	uint16_t  b16 [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
+	uint8_t   b8  [SCALER_MAX_MUL_HEIGHT + 1][SCALER_MAXLINE_WIDTH];
 } scalerWriteCache;
 //scalerFrameCache_t scalerFrameCache;
 scalerSourceCache_t scalerSourceCache;

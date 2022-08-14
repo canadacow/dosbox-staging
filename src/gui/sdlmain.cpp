@@ -572,6 +572,9 @@ check_surface:
 		case 32:
 			if (flags & GFX_CAN_32) flags&=~(GFX_CAN_8|GFX_CAN_15|GFX_CAN_16);
 			break;
+		case 64:
+			if (flags & GFX_CAN_64) flags &= ~(GFX_CAN_8 | GFX_CAN_15 | GFX_CAN_16);
+			break;
 		}
 		flags |= GFX_CAN_RANDOM;
 		break;
@@ -579,10 +582,12 @@ check_surface:
 	case SCREEN_OPENGL:
 #endif
 	case SCREEN_TEXTURE:
-		// We only accept 32bit output from the scalers here
-		if (!(flags&GFX_CAN_32)) goto check_surface;
-		flags|=GFX_SCALING;
-		flags&=~(GFX_CAN_8|GFX_CAN_15|GFX_CAN_16);
+		{
+			auto bitFlags = flags & (GFX_CAN_32 | GFX_CAN_64);
+			if (bitFlags == 0) goto check_surface;
+			flags |= GFX_SCALING;
+			flags &= ~(GFX_CAN_8 | GFX_CAN_15 | GFX_CAN_16);
+		}
 		break;
 	default:
 		goto check_surface;
@@ -1714,7 +1719,7 @@ dosurface:
 		/* Use renderer's default format */
 		SDL_RendererInfo rinfo;
 		SDL_GetRendererInfo(sdl.renderer, &rinfo);
-		const auto texture_format = rinfo.texture_formats[0];
+		const auto texture_format = rinfo.texture_formats[6];
 		sdl.texture.texture = SDL_CreateTexture(sdl.renderer, texture_format,
 		                                        SDL_TEXTUREACCESS_STREAMING, width, height);
 
@@ -1726,7 +1731,7 @@ dosurface:
 		}
 
 		assert(sdl.texture.input_surface == nullptr); // ensure we don't leak
-		sdl.texture.input_surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, texture_format);
+		sdl.texture.input_surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 64, texture_format);
 		if (!sdl.texture.input_surface) {
 			LOG_WARNING("SDL: Error while preparing texture input");
 			goto dosurface;
@@ -1745,6 +1750,7 @@ dosurface:
 			case 16: retFlags = GFX_CAN_16; break;
 			case 24: /* SDL_BYTESPERPIXEL is probably 4, though. */
 			case 32: retFlags = GFX_CAN_32; break;
+			case 64: retFlags = GFX_CAN_64; break;
 		}
 		retFlags |= GFX_SCALING;
 

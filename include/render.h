@@ -43,8 +43,9 @@ struct RenderPal_t {
 	} rgb[256] = {};
 
 	union {
-		uint16_t b16[256];
-		uint32_t b32[256] = {};
+		uint16_t  b16[256];
+		uint32_t  b32[256];
+		HalfFloat b64[256] = {};
 	} lut = {};
 
 	bool changed          = false;

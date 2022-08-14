@@ -1014,13 +1014,7 @@
     <ClInclude Include="..\src\hardware\serialport\softmodem.h">
       <Filter>src\hardware\serialport</Filter>
     </ClInclude>
-    <ClInclude Include="..\src\hardware\serialport\serialmouse.h">
-      <Filter>src\hardware\serialport</Filter>
-    </ClInclude>
     <ClInclude Include="..\src\ints\int10.h">
-      <Filter>src\ints</Filter>
-    </ClInclude>
-    <ClInclude Include="..\src\ints\mouse_core.h">
       <Filter>src\ints</Filter>
     </ClInclude>
     <ClInclude Include="..\src\ints\xms.h">
@@ -1208,6 +1202,7 @@
     </ClInclude>
     <ClInclude Include="..\src\libs\zmbv\Resource.h" />
     <ClInclude Include="..\src\libs\zmbv\zmbv.h" />
+    <ClInclude Include="..\src\hardware\serialport\softmouse.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\winres.rc">

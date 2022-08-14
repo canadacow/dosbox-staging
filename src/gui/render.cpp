@@ -44,10 +44,114 @@
 
 #include "render_scalers.h"
 
+#pragma optimize("", off)
+
+#include "fp16.h"
+
 Render_t render;
 ScalerLineHandler_t RENDER_DrawLine;
 
 static void RENDER_CallBack(GFX_CallBackFunctions_t function);
+
+static void GetDisplayValues()
+{
+	UINT32 numPaths;
+	UINT32 numModes;
+	std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+	std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+	do {
+		result = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths,
+			&numModes);
+		if (result != ERROR_SUCCESS) {
+			return {};
+		}
+		// allocate the recommended amount of space
+		paths.resize(numPaths);
+		modes.resize(numModes);
+
+		result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
+			&numModes, modes.data(), NULL);
+	}
+}
+
+struct UNORMValue
+{
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t a;
+};
+
+static float linearTosRgb(uint8_t bval)
+{
+	float val = ((float)bval / 255.0f);
+	return pow(val, 1.0 / 2.2);
+}
+
+static float sRgbToLinear(uint8_t bval)
+{
+	float val = ((float)bval / 255.0f);
+	return pow(val, 2.2);
+}
+
+static float unormToFloat(uint8_t bval)
+{
+	return ((float)bval / 255.0f);
+}
+
+static float sRgbToScRgb(float val)
+{
+	if (val < 0.0)
+	{
+		return (0.0f);
+	}
+	else if (val <= 0.04045)
+	{
+		return (val / 12.92f);
+	}
+	else if (val < 1.0f)
+	{
+		return (float)pow(((double)val + 0.055) / 1.055, 2.4);
+	}
+	else
+	{
+		return (1.0f);
+	}
+}
+
+static uint16_t UNORMToHalf(uint8_t unorm)
+{
+	return fp16_ieee_from_fp32_value(sRgbToScRgb(sRgbToLinear(unorm)));
+}
+
+static HalfFloat Convert32BitsToHalf(uint8_t r, uint8_t g, uint8_t b)
+{
+	static uint16_t HFOne = fp16_ieee_from_fp32_value(1.0f);
+	static uint16_t HFZero = fp16_ieee_from_fp32_value(0.0f);
+
+	HalfFloat res;
+	res.r = UNORMToHalf(r);
+	res.g = UNORMToHalf(g);
+	res.b = UNORMToHalf(b);
+	res.a = HFOne;
+
+	return res;
+}
+
+static HalfFloat Convert32BitsToHalf(uint32_t inValue)
+{
+	static uint16_t HFOne = fp16_ieee_from_fp32_value(1.0f);
+	static uint16_t HFZero = fp16_ieee_from_fp32_value(0.0f);
+
+	UNORMValue* val = (UNORMValue*)&inValue;
+	HalfFloat res;
+	res.r = UNORMToHalf(val->r);
+	res.g = UNORMToHalf(val->g);
+	res.b = UNORMToHalf(val->b);
+	res.a = HFOne;
+
+	return res;
+}
 
 static void Check_Palette(void)
 {
@@ -73,6 +177,20 @@ static void Check_Palette(void)
 				render.pal.changed     = true;
 				render.pal.modified[i] = 1;
 				render.pal.lut.b16[i]  = new_pal;
+			}
+		}
+		break;
+	case scalerMode64:
+		for (i = render.pal.first; i <= render.pal.last; i++) {
+			uint8_t r = render.pal.rgb[i].red;
+			uint8_t g = render.pal.rgb[i].green;
+			uint8_t b = render.pal.rgb[i].blue;
+
+			HalfFloat hf = Convert32BitsToHalf(r, g, b);
+			if (hf != render.pal.lut.b64[i]) {
+				render.pal.changed = true;
+				render.pal.modified[i] = 1;
+				render.pal.lut.b64[i] = hf;
 			}
 		}
 		break;
@@ -303,6 +421,330 @@ static Bitu MakeAspectTable(Bitu skip, Bitu height, double scaley, Bitu miny)
 	return linesadded;
 }
 
+static inline void BituMove(void* _dst, const void* _src, Bitu size) {
+	Bitu* dst = (Bitu*)(_dst);
+	const Bitu* src = (Bitu*)(_src);
+	size /= sizeof(Bitu);
+	for (Bitu x = 0; x < size; x++)
+		dst[x] = src[x];
+}
+
+static inline void ScalerAddLines(Bitu changed, Bitu count) {
+	if ((Scaler_ChangedLineIndex & 1) == changed) {
+		Scaler_ChangedLines[Scaler_ChangedLineIndex] += count;
+	}
+	else {
+		Scaler_ChangedLines[++Scaler_ChangedLineIndex] = count;
+	}
+	render.scale.outWrite += render.scale.outPitch * count;
+}
+
+static void HDR_8_to_64(const void* s)
+{
+#define SRCTYPE uint8_t
+#define PTYPE HalfFloat
+#define PMAKE(_VAL) render.pal.lut.b64[_VAL]
+#define SCALERWIDTH		1
+#define SCALERHEIGHT	1
+#define PSIZE 8
+#define SCALERFUNC line0[0] = P;
+
+	Bitu hadChange = 0;
+	const SRCTYPE* src = (SRCTYPE*)s;
+	SRCTYPE* cache = (SRCTYPE*)(render.scale.cacheRead);
+	render.scale.cacheRead += render.scale.cachePitch;
+	PTYPE* line0 = (PTYPE*)(render.scale.outWrite);
+	constexpr uint8_t address_step = sizeof(Bitu) / sizeof(SRCTYPE);
+
+	for (Bits x = render.src.width; x > 0;) {
+		const auto src_ptr = reinterpret_cast<const uint8_t*>(src);
+		const auto src_val = read_unaligned_size_t(src_ptr);
+
+		const auto cache_ptr = reinterpret_cast<uint8_t*>(cache);
+		const auto cache_val = read_unaligned_size_t(cache_ptr);
+
+		if (src_val == cache_val) {
+			x -= address_step;
+			src += address_step;
+			cache += address_step;
+			line0 += address_step * SCALERWIDTH;
+		}
+		else {
+			hadChange = 1;
+			for (Bitu i = x > 32 ? 32 : x; i > 0; i--, x--) {
+				const SRCTYPE S = *src;
+				*cache = S;
+				src++; cache++;
+				const PTYPE P = PMAKE(S);
+				SCALERFUNC;
+				line0 += SCALERWIDTH;
+			}
+		}
+	}
+
+	Bitu scaleLines = Scaler_Aspect[render.scale.outLine++];
+	if (scaleLines - SCALERHEIGHT && hadChange) {
+		BituMove(render.scale.outWrite + render.scale.outPitch * SCALERHEIGHT,
+			render.scale.outWrite + render.scale.outPitch * (SCALERHEIGHT - 1),
+			render.src.width * SCALERWIDTH * PSIZE);
+	}
+	ScalerAddLines(hadChange, scaleLines);
+
+#undef SRCTYPE 
+#undef PTYPE
+#undef PMAKE(_VAL)
+#undef SCALERWIDTH
+#undef SCALERHEIGHT
+#undef PSIZE
+#undef SCALERFUNC
+}
+
+static void HDR_8pal_to_64(const void* s)
+{
+#define SRCTYPE uint8_t
+#define PTYPE HalfFloat
+#define PMAKE(_VAL) render.pal.lut.b64[_VAL]
+#define SCALERWIDTH		1
+#define SCALERHEIGHT	1
+#define PSIZE 8
+#define SCALERFUNC line0[0] = P;
+
+	Bitu hadChange = 0;
+	const SRCTYPE* src = (SRCTYPE*)s;
+	SRCTYPE* cache = (SRCTYPE*)(render.scale.cacheRead);
+	render.scale.cacheRead += render.scale.cachePitch;
+	PTYPE* line0 = (PTYPE*)(render.scale.outWrite);
+	for (Bits x = render.src.width; x > 0;) {
+		if (*(uint32_t const*)src == *(uint32_t*)cache && !(
+			render.pal.modified[src[0]] |
+			render.pal.modified[src[1]] |
+			render.pal.modified[src[2]] |
+			render.pal.modified[src[3]])) {
+			x -= 4;
+			src += 4;
+			cache += 4;
+			line0 += 4 * SCALERWIDTH;
+		} else {
+			hadChange = 1;
+			for (Bitu i = x > 32 ? 32 : x; i > 0; i--, x--) {
+				const SRCTYPE S = *src;
+				*cache = S;
+				src++; cache++;
+				const PTYPE P = PMAKE(S);
+				SCALERFUNC;
+				line0 += SCALERWIDTH;
+			}
+		}
+	}
+
+	Bitu scaleLines = Scaler_Aspect[render.scale.outLine++];
+	if (scaleLines - SCALERHEIGHT && hadChange) {
+		BituMove(render.scale.outWrite + render.scale.outPitch * SCALERHEIGHT,
+			render.scale.outWrite + render.scale.outPitch * (SCALERHEIGHT - 1),
+			render.src.width * SCALERWIDTH * PSIZE);
+	}
+	ScalerAddLines(hadChange, scaleLines);
+
+#undef SRCTYPE 
+#undef PTYPE
+#undef PMAKE(_VAL)
+#undef SCALERWIDTH
+#undef SCALERHEIGHT
+#undef PSIZE
+#undef SCALERFUNC
+}
+
+static void HDR_15_to_64(const void* s)
+{
+	printf("");
+}
+
+static void HDR_16_to_64(const void* s)
+{
+#define SRCTYPE uint16_t
+#define PTYPE HalfFloat
+#define PMAKE(_VAL) Convert32BitsToHalf((((_VAL<<16)&0x00F80000)|((_VAL<<11)&0x00070000)|((_VAL<<13)&0x0000E000)|((_VAL>>3)&0x00001C00)|((_VAL<<7)&0x00000300)|((_VAL>>5)&0x000000F8)|((_VAL>>10)&0x00000007)))
+#define SCALERWIDTH		1
+#define SCALERHEIGHT	1
+#define PSIZE 8
+#define SCALERFUNC line0[0] = P;
+
+	Bitu hadChange = 0;
+	const SRCTYPE* src = (SRCTYPE*)s;
+	SRCTYPE* cache = (SRCTYPE*)(render.scale.cacheRead);
+	render.scale.cacheRead += render.scale.cachePitch;
+	PTYPE* line0 = (PTYPE*)(render.scale.outWrite);
+	constexpr uint8_t address_step = sizeof(Bitu) / sizeof(SRCTYPE);
+
+	for (Bits x = render.src.width; x > 0;) {
+		const auto src_ptr = reinterpret_cast<const uint8_t*>(src);
+		const auto src_val = read_unaligned_size_t(src_ptr);
+
+		const auto cache_ptr = reinterpret_cast<uint8_t*>(cache);
+		const auto cache_val = read_unaligned_size_t(cache_ptr);
+
+		if (src_val == cache_val) {
+			x -= address_step;
+			src += address_step;
+			cache += address_step;
+			line0 += address_step * SCALERWIDTH;
+		}
+		else {
+			hadChange = 1;
+			for (Bitu i = x > 32 ? 32 : x; i > 0; i--, x--) {
+				const SRCTYPE S = *src;
+				*cache = S;
+				src++; cache++;
+				const PTYPE P = PMAKE(S);
+				SCALERFUNC;
+				line0 += SCALERWIDTH;
+			}
+		}
+	}
+
+	Bitu scaleLines = Scaler_Aspect[render.scale.outLine++];
+	if (scaleLines - SCALERHEIGHT && hadChange) {
+		BituMove(render.scale.outWrite + render.scale.outPitch * SCALERHEIGHT,
+			render.scale.outWrite + render.scale.outPitch * (SCALERHEIGHT - 1),
+			render.src.width * SCALERWIDTH * PSIZE);
+	}
+	ScalerAddLines(hadChange, scaleLines);
+
+#undef SRCTYPE 
+#undef PTYPE
+#undef PMAKE(_VAL)
+#undef SCALERWIDTH
+#undef SCALERHEIGHT
+#undef PSIZE
+#undef SCALERFUNC
+}
+
+#include "rgb24.h"
+
+static void HDR_24_to_64(const void* s)
+{
+#define SRCTYPE rgb24
+#define PTYPE HalfFloat
+#define PMAKE(_VAL) Convert32BitsToHalf((_VAL))
+#define SCALERWIDTH		1
+#define SCALERHEIGHT	1
+#define PSIZE 8
+#define SCALERFUNC line0[0] = P;
+
+	Bitu hadChange = 0;
+	const SRCTYPE* src = (SRCTYPE*)s;
+	SRCTYPE* cache = (SRCTYPE*)(render.scale.cacheRead);
+	render.scale.cacheRead += render.scale.cachePitch;
+	PTYPE* line0 = (PTYPE*)(render.scale.outWrite);
+	constexpr uint8_t address_step = sizeof(Bitu) / sizeof(SRCTYPE);
+
+	for (Bits x = render.src.width; x > 0;) {
+		const auto src_ptr = reinterpret_cast<const uint8_t*>(src);
+		const auto src_val = read_unaligned_size_t(src_ptr);
+
+		const auto cache_ptr = reinterpret_cast<uint8_t*>(cache);
+		const auto cache_val = read_unaligned_size_t(cache_ptr);
+
+		if (src_val == cache_val) {
+			x -= address_step;
+			src += address_step;
+			cache += address_step;
+			line0 += address_step * SCALERWIDTH;
+		}
+		else {
+			hadChange = 1;
+			for (Bitu i = x > 32 ? 32 : x; i > 0; i--, x--) {
+				const SRCTYPE S = *src;
+				*cache = S;
+				src++; cache++;
+				const PTYPE P = PMAKE(S);
+				SCALERFUNC;
+				line0 += SCALERWIDTH;
+			}
+		}
+	}
+
+	Bitu scaleLines = Scaler_Aspect[render.scale.outLine++];
+	if (scaleLines - SCALERHEIGHT && hadChange) {
+		BituMove(render.scale.outWrite + render.scale.outPitch * SCALERHEIGHT,
+			render.scale.outWrite + render.scale.outPitch * (SCALERHEIGHT - 1),
+			render.src.width * SCALERWIDTH * PSIZE);
+	}
+	ScalerAddLines(hadChange, scaleLines);
+
+#undef SRCTYPE 
+#undef PTYPE
+#undef PMAKE(_VAL)
+#undef SCALERWIDTH
+#undef SCALERHEIGHT
+#undef PSIZE
+#undef SCALERFUNC
+}
+
+
+static void HDR_32_to_64(const void* s)
+{
+#define SRCTYPE uint32_t
+#define PTYPE HalfFloat
+#define PMAKE(_VAL) Convert32BitsToHalf(_VAL)
+#define SCALERWIDTH		1
+#define SCALERHEIGHT	1
+#define PSIZE 8
+#define SCALERFUNC line0[0] = P;
+
+	Bitu hadChange = 0;
+	const SRCTYPE* src = (SRCTYPE*)s;
+	SRCTYPE* cache = (SRCTYPE*)(render.scale.cacheRead);
+	render.scale.cacheRead += render.scale.cachePitch;
+	PTYPE* line0 = (PTYPE*)(render.scale.outWrite);
+	constexpr uint8_t address_step = sizeof(Bitu) / sizeof(SRCTYPE);
+
+	for (Bits x = render.src.width; x > 0;) {
+		const auto src_ptr = reinterpret_cast<const uint8_t*>(src);
+		const auto src_val = read_unaligned_size_t(src_ptr);
+
+		const auto cache_ptr = reinterpret_cast<uint8_t*>(cache);
+		const auto cache_val = read_unaligned_size_t(cache_ptr);
+
+		if (src_val == cache_val) {
+			x -= address_step;
+			src += address_step;
+			cache += address_step;
+			line0 += address_step * SCALERWIDTH;
+		}
+		else {
+			hadChange = 1;
+			for (Bitu i = x > 32 ? 32 : x; i > 0; i--, x--) {
+				const SRCTYPE S = *src;
+				*cache = S;
+				src++; cache++;
+				const PTYPE P = PMAKE(S);
+				SCALERFUNC;
+				line0 += SCALERWIDTH;
+			}
+		}
+	}
+
+	Bitu scaleLines = Scaler_Aspect[render.scale.outLine++];
+	if (scaleLines - SCALERHEIGHT && hadChange) {
+		BituMove(render.scale.outWrite + render.scale.outPitch * SCALERHEIGHT,
+			render.scale.outWrite + render.scale.outPitch * (SCALERHEIGHT - 1),
+			render.src.width * SCALERWIDTH * PSIZE);
+	}
+	ScalerAddLines(hadChange, scaleLines);
+
+#undef SRCTYPE 
+#undef PTYPE
+#undef PMAKE(_VAL)
+#undef SCALERWIDTH
+#undef SCALERHEIGHT
+#undef PSIZE
+#undef SCALERFUNC
+}
+
+
+
+
 static void RENDER_Reset(void)
 {
 	Bitu width  = render.src.width;
@@ -461,6 +903,11 @@ static void RENDER_Reset(void)
 		gfx_flags |= GFX_LOVE_32;
 		gfx_flags = (gfx_flags & ~GFX_CAN_8) | GFX_RGBONLY;
 		break;
+	case 64:
+		render.src.start = (render.src.width * 8) / sizeof(Bitu);
+		gfx_flags |= GFX_LOVE_64;
+		gfx_flags = (gfx_flags & ~GFX_CAN_8) | GFX_RGBONLY;
+		break;
 	}
 	gfx_flags = GFX_GetBestMode(gfx_flags);
 	if (!gfx_flags) {
@@ -518,6 +965,8 @@ static void RENDER_Reset(void)
 		render.scale.outMode = scalerMode16;
 	else if (gfx_flags & GFX_CAN_32)
 		render.scale.outMode = scalerMode32;
+	else if (gfx_flags & GFX_CAN_64)
+		render.scale.outMode = scalerMode64;
 	else
 		E_Exit("Failed to create a rendering output");
 	ScalerLineBlock_t *lineBlock;
@@ -546,39 +995,80 @@ static void RENDER_Reset(void)
 			lineBlock                   = &simpleBlock->Random;
 		}
 	}
-	switch (render.src.bpp) {
-	case 8:
-		render.scale.lineHandler = (*lineBlock)[0][render.scale.outMode];
-		render.scale.linePalHandler = (*lineBlock)[5][render.scale.outMode];
-		render.scale.inMode         = scalerMode8;
-		render.scale.cachePitch     = render.src.width * 1;
-		break;
-	case 15:
-		render.scale.lineHandler = (*lineBlock)[1][render.scale.outMode];
-		render.scale.linePalHandler = 0;
-		render.scale.inMode         = scalerMode15;
-		render.scale.cachePitch     = render.src.width * 2;
-		break;
-	case 16:
-		render.scale.lineHandler = (*lineBlock)[2][render.scale.outMode];
-		render.scale.linePalHandler = 0;
-		render.scale.inMode         = scalerMode16;
-		render.scale.cachePitch     = render.src.width * 2;
-		break;
-	case 24:
-		render.scale.lineHandler = (*lineBlock)[3][render.scale.outMode];
-		render.scale.linePalHandler = 0;
-		render.scale.inMode         = scalerMode32;
-		render.scale.cachePitch     = render.src.width * 3;
-		break;
-	case 32:
-		render.scale.lineHandler = (*lineBlock)[4][render.scale.outMode];
-		render.scale.linePalHandler = 0;
-		render.scale.inMode         = scalerMode32;
-		render.scale.cachePitch     = render.src.width * 4;
-		break;
-	default: E_Exit("RENDER:Wrong source bpp %u", render.src.bpp);
+
+	if (render.scale.outMode == scalerMode64)
+	{
+		switch (render.src.bpp) {
+		case 8:
+			render.scale.lineHandler = HDR_8_to_64;
+			render.scale.linePalHandler = HDR_8pal_to_64;
+			render.scale.inMode = scalerMode8;
+			render.scale.cachePitch = render.src.width * 1;
+			break;
+		case 15:
+			render.scale.lineHandler = HDR_15_to_64;
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode15;
+			render.scale.cachePitch = render.src.width * 2;
+			break;
+		case 16:
+			render.scale.lineHandler = HDR_16_to_64;
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode16;
+			render.scale.cachePitch = render.src.width * 2;
+			break;
+		case 24:
+			render.scale.lineHandler = HDR_24_to_64;
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode32;
+			render.scale.cachePitch = render.src.width * 3;
+			break;
+		case 32:
+			render.scale.lineHandler = HDR_32_to_64;
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode32;
+			render.scale.cachePitch = render.src.width * 4;
+			break;
+		default: E_Exit("RENDER:Wrong source bpp %u", render.src.bpp);
+		}
 	}
+	else
+	{
+		switch (render.src.bpp) {
+		case 8:
+			render.scale.lineHandler = (*lineBlock)[0][render.scale.outMode];
+			render.scale.linePalHandler = (*lineBlock)[5][render.scale.outMode];
+			render.scale.inMode = scalerMode8;
+			render.scale.cachePitch = render.src.width * 1;
+			break;
+		case 15:
+			render.scale.lineHandler = (*lineBlock)[1][render.scale.outMode];
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode15;
+			render.scale.cachePitch = render.src.width * 2;
+			break;
+		case 16:
+			render.scale.lineHandler = (*lineBlock)[2][render.scale.outMode];
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode16;
+			render.scale.cachePitch = render.src.width * 2;
+			break;
+		case 24:
+			render.scale.lineHandler = (*lineBlock)[3][render.scale.outMode];
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode32;
+			render.scale.cachePitch = render.src.width * 3;
+			break;
+		case 32:
+			render.scale.lineHandler = (*lineBlock)[4][render.scale.outMode];
+			render.scale.linePalHandler = 0;
+			render.scale.inMode = scalerMode32;
+			render.scale.cachePitch = render.src.width * 4;
+			break;
+		default: E_Exit("RENDER:Wrong source bpp %u", render.src.bpp);
+		}
+	}
+
 	render.scale.blocks    = render.src.width / SCALER_BLOCKSIZE;
 	render.scale.lastBlock = render.src.width % SCALER_BLOCKSIZE;
 	render.scale.inHeight  = render.src.height;

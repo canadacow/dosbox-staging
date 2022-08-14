@@ -48,10 +48,28 @@
 #define SCALER_COMPLEXHEIGHT	600
 #endif
 
+struct HalfFloat
+{
+	uint16_t r;
+	uint16_t g;
+	uint16_t b;
+	uint16_t a;
+
+	bool operator==(const HalfFloat& rhs) const
+	{
+		return (memcmp(this, &rhs, sizeof(HalfFloat)) == 0);
+	}
+
+	bool operator!=(const HalfFloat& rhs) const
+	{
+		return (memcmp(this, &rhs, sizeof(HalfFloat)) != 0);
+	}
+};
+
 #define SCALER_BLOCKSIZE	16
 
 typedef enum {
-	scalerMode8, scalerMode15, scalerMode16, scalerMode32
+	scalerMode8, scalerMode15, scalerMode16, scalerMode32, scalerMode64
 } scalerMode_t;
 
 typedef enum scalerOperation {
@@ -83,12 +101,14 @@ extern uint16_t Scaler_ChangedLines[];
 /* Not entirely happy about those +2's since they make a non power of 2, with muls instead of shift */
 typedef uint8_t scalerChangeCache_t [SCALER_COMPLEXHEIGHT][SCALER_COMPLEXWIDTH / SCALER_BLOCKSIZE] ;
 typedef union {
+	HalfFloat b64[SCALER_COMPLEXHEIGHT][SCALER_COMPLEXWIDTH];
 	uint32_t b32	[SCALER_COMPLEXHEIGHT] [SCALER_COMPLEXWIDTH];
 	uint16_t b16	[SCALER_COMPLEXHEIGHT] [SCALER_COMPLEXWIDTH];
 	uint8_t b8	[SCALER_COMPLEXHEIGHT] [SCALER_COMPLEXWIDTH];
 } scalerFrameCache_t;
 #endif
 typedef union {
+	HalfFloat b64[SCALER_MAXHEIGHT][SCALER_MAXWIDTH];
 	uint32_t b32	[SCALER_MAXHEIGHT] [SCALER_MAXWIDTH];
 	uint16_t b16	[SCALER_MAXHEIGHT] [SCALER_MAXWIDTH];
 	uint8_t b8	[SCALER_MAXHEIGHT] [SCALER_MAXWIDTH];
