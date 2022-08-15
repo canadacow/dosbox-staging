@@ -307,6 +307,23 @@ void OPENGL_ERROR(const char*) {
 #endif
 #endif
 
+struct TextureFormat
+{
+	int w;
+	int h;
+	Uint32 format;
+};
+
+typedef void (*SDL_D3D11_GetTexture_fn)(SDL_Texture* texture, void** outputTexture);
+
+static SDL_Texture* s_effectTexture = nullptr;
+static TextureFormat s_effectFormat{};
+static HMODULE s_SDLModule = NULL;
+static SDL_D3D11_GetTexture_fn s_GetTextureFn = nullptr;
+static Microsoft::WRL::ComPtr<ID3D11ComputeShader> s_cs = {};
+static Microsoft::WRL::ComPtr<ID3D11SamplerState> s_ss = {};
+static Microsoft::WRL::ComPtr<ID3D11Buffer> s_buffer = {};
+
 extern "C" void SDL_CDROMQuit(void);
 static void QuitSDL()
 {
@@ -1182,6 +1199,9 @@ static SDL_Window *SetWindowMode(SCREEN_TYPES screen_type,
 
 		if (screen_type == SCREEN_TEXTURE) {
 			if (sdl.renderer) {
+				s_ss.Reset();
+				s_cs.Reset();
+				s_buffer.Reset();
 				SDL_DestroyRenderer(sdl.renderer);
 				sdl.renderer = nullptr;
 			}
@@ -2382,22 +2402,6 @@ static void update_frame_texture([[maybe_unused]] const uint16_t *changedLines)
 	}
 }
 
-struct TextureFormat
-{
-	int w;
-	int h;
-	Uint32 format;
-};
-
-typedef void (*SDL_D3D11_GetTexture_fn)(SDL_Texture* texture, void** outputTexture);
-
-static SDL_Texture* s_effectTexture = nullptr;
-static TextureFormat s_effectFormat{};
-static HMODULE s_SDLModule = NULL;
-static SDL_D3D11_GetTexture_fn s_GetTextureFn;
-static Microsoft::WRL::ComPtr<ID3D11ComputeShader> s_cs;
-static Microsoft::WRL::ComPtr<ID3D11SamplerState> s_ss;
-
 const char* crt_lottes = R"(
 RWTexture2D<float4> OutText : register(u0);
 Texture2D<float4> SrcText : register(t0);
@@ -2414,7 +2418,7 @@ SamplerState BilinearClamp : register(s0);
 #define brightboost 1
 #define hardBloomScan -2.0
 #define hardBloomPix -1.5
-#define bloomAmount 1.0/16.0
+#define bloomAmount 4.0/16.0
 #define shape 2.0
 
 #define DO_BLOOM 1
@@ -2577,10 +2581,19 @@ float3 Mask(float2 pos){
   }
 
   return mask;
-}    
+}
+
+cbuffer CS_CONSTANT_BUFFER : register(b0)
+{
+	int scanlineStart;
+	int scanlineEnd;
+	int frameNumber;
+    int dummy;
+};
 
 float4 crt_lottes(float2 texture_size, float2 video_size, float2 output_size, float2 tex)
 {
+
   float2 pos=Warp(tex.xy*(texture_size.xy/video_size.xy))*(video_size.xy/texture_size.xy);
   float3 outColor = Tri(pos, texture_size);
 
@@ -2588,6 +2601,12 @@ float4 crt_lottes(float2 texture_size, float2 video_size, float2 output_size, fl
   //Add Bloom
   outColor.rgb+=Bloom(pos, texture_size)*bloomAmount;
 #endif
+
+  int2 scanline = pos * texture_size;
+  if(scanline.y > scanlineStart && scanline.y < scanlineEnd)
+  {
+      outColor.rgb *= 4.0;
+  }
 
   if(shadowMask)
     outColor.rgb*=Mask(floor(tex.xy*(texture_size.xy/video_size.xy)*output_size.xy)+float2(0.5,0.5));
@@ -2636,6 +2655,7 @@ void main( uint3 DTid : SV_DispatchThreadID )
 static void ShadeSDLDX11()
 {
 	using namespace Microsoft::WRL;
+	static uint32_t frameNumber = 0;
 
 	if (sdl.window == nullptr)
 		return;
@@ -2701,6 +2721,13 @@ static void ShadeSDLDX11()
 		sampDesc.MinLOD = -FLT_MAX;
 		sampDesc.MaxLOD = FLT_MAX;
 		device->CreateSamplerState(&sampDesc, s_ss.GetAddressOf());
+
+		D3D11_BUFFER_DESC bufDesc{};
+		bufDesc.ByteWidth = 256;
+		bufDesc.Usage = D3D11_USAGE_DYNAMIC;
+		bufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bufDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		device->CreateBuffer(&bufDesc, nullptr, s_buffer.GetAddressOf());
 	}
 
 	ComPtr<ID3D11Texture2D> sourceTexture;
@@ -2731,6 +2758,25 @@ static void ShadeSDLDX11()
 	auto uavList = uav.Get();
 	auto sampList = s_ss.Get();
 	auto shaderList = srv.Get();
+	auto bufList = s_buffer.Get();
+
+	struct BuffStruct
+	{
+		uint32_t scanlineStart;
+		uint32_t scanlineEnd;
+		uint32_t frameNumber;
+		uint32_t dummy;
+	};
+
+	D3D11_MAPPED_SUBRESOURCE mapping;
+	context->Map(s_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping);
+
+	BuffStruct* bs = (BuffStruct*)mapping.pData;
+
+	bs->scanlineStart = 0;
+	bs->scanlineEnd = 0;
+	bs->frameNumber = frameNumber;
+	context->Unmap(s_buffer.Get(), 0);
 
 	std::vector<void*> emptyResource;
 	emptyResource.resize(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
@@ -2745,17 +2791,22 @@ static void ShadeSDLDX11()
 	context->CSSetShader(s_cs.Get(), nullptr, 0);
 	context->CSSetSamplers(0, 1, &sampList);
 	context->CSSetShaderResources(0, 1, &shaderList);
+	context->CSSetConstantBuffers(0, 1, &bufList);
 
 	context->Dispatch(currWidth / 8, currHeight / 8, 1);
 
 	shaderList = nullptr;
 	sampList = nullptr;
 	uavList = nullptr;
+	bufList = nullptr;
 	context->CSSetShaderResources(0, 1, &shaderList);
 	context->CSSetSamplers(0, 1, &sampList);
 	context->CSSetUnorderedAccessViews(0, 1, &uavList, nullptr);
+	context->CSSetConstantBuffers(0, 1, &bufList);
 
 	context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, oldSrv.data());
+
+	++frameNumber;
 }
 
 static bool present_frame_texture()
