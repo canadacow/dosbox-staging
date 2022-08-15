@@ -40,6 +40,8 @@
 #ifdef WIN32
 #include <signal.h>
 #include <process.h>
+#include <wrl.h>
+#include <d3d11.h>
 #endif
 
 #include <SDL.h>
@@ -190,6 +192,8 @@ PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer = NULL;
 #include <winuser.h>
 #define STDOUT_FILE "stdout.txt"
 #define STDERR_FILE "stderr.txt"
+#pragma comment(lib, "d3dcompiler.lib")
+#include <d3dcompiler.h>
 #endif
 
 #if defined(HAVE_SETPRIORITY)
@@ -2378,12 +2382,177 @@ static void update_frame_texture([[maybe_unused]] const uint16_t *changedLines)
 	}
 }
 
+struct TextureFormat
+{
+	int w;
+	int h;
+	Uint32 format;
+};
+
+typedef void (*SDL_D3D11_GetTexture_fn)(SDL_Texture* texture, void** outputTexture);
+
+static SDL_Texture* s_effectTexture = nullptr;
+static TextureFormat s_effectFormat{};
+static HMODULE s_SDLModule = NULL;
+static SDL_D3D11_GetTexture_fn s_GetTextureFn;
+static Microsoft::WRL::ComPtr<ID3D11ComputeShader> s_cs;
+static Microsoft::WRL::ComPtr<ID3D11SamplerState> s_ss;
+
+const char* computeShader = R"(
+RWTexture2D<float4> OutText : register(u0);
+Texture2D<float4> SrcText : register(t0);
+SamplerState BilinearClamp : register(s0);
+
+[numthreads( 8, 8, 1 )]
+void main( uint3 DTid : SV_DispatchThreadID )
+{
+	float2 TexDims;
+	OutText.GetDimensions(TexDims.x, TexDims.y);
+
+	float2 TexelSize = 1.0 / TexDims;
+
+    float2 UV = TexelSize * (DTid.xy + 0.5);
+    float4 Src1 = SrcText.SampleLevel(BilinearClamp, UV, 0);
+
+    OutText[DTid.xy] = Src1;
+}
+)";
+
+static void ShadeSDLDX11()
+{
+	using namespace Microsoft::WRL;
+
+	if (sdl.window == nullptr)
+		return;
+
+	ComPtr<ID3D11Device> device = SDL_RenderGetD3D11Device(sdl.renderer);
+
+	bool needsNewEffectTexture = false;
+
+	int currWidth, currHeight;
+	SDL_GetWindowSize(sdl.window, &currWidth, &currHeight);
+
+	if (s_effectTexture)
+	{
+		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.w != currWidth);
+		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.h != currHeight);
+		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.format != sdl.texture.pixelFormat->format);
+
+		if (needsNewEffectTexture)
+		{
+			SDL_DestroyTexture(s_effectTexture);
+		}
+	}
+	else
+	{
+		needsNewEffectTexture = true;
+	}
+
+	if (needsNewEffectTexture)
+	{
+		s_effectTexture = SDL_CreateTexture(sdl.renderer, sdl.texture.pixelFormat->format, SDL_TEXTUREACCESS_TARGET,
+											currWidth, currHeight);
+
+		s_effectFormat.w = currWidth;
+		s_effectFormat.h = currHeight;
+		s_effectFormat.format = sdl.texture.pixelFormat->format;
+	}
+
+	if (s_SDLModule == nullptr)
+	{
+		s_SDLModule = LoadLibraryA("SDL2.DLL");
+		s_GetTextureFn = (SDL_D3D11_GetTexture_fn)GetProcAddress(s_SDLModule, "SDL_D3D11_GetTexture");
+
+		ComPtr<ID3DBlob> codeBlob;
+		ComPtr<ID3DBlob> errorBlob;
+
+		D3DCompile(computeShader, strlen(computeShader), "computeShader", nullptr, nullptr, "main", "cs_5_0", 0, 0, codeBlob.GetAddressOf(), errorBlob.GetAddressOf());
+		
+		device->CreateComputeShader(codeBlob->GetBufferPointer(), codeBlob->GetBufferSize(), nullptr, s_cs.GetAddressOf());
+
+		D3D11_SAMPLER_DESC sampDesc{};
+		sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sampDesc.MipLODBias = 0;
+		sampDesc.MaxAnisotropy = 1;
+		sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		sampDesc.BorderColor[0] = 0.0f;
+		sampDesc.BorderColor[1] = 0.0f;
+		sampDesc.BorderColor[2] = 0.0f;
+		sampDesc.BorderColor[3] = 0.0f;
+		sampDesc.MinLOD = -FLT_MAX;
+		sampDesc.MaxLOD = FLT_MAX;
+		device->CreateSamplerState(&sampDesc, s_ss.GetAddressOf());
+	}
+
+	ComPtr<ID3D11Texture2D> sourceTexture;
+	ComPtr<ID3D11Texture2D> destTexture;
+
+	s_GetTextureFn(sdl.texture.texture, (void**)sourceTexture.GetAddressOf());
+	s_GetTextureFn(s_effectTexture, (void**)destTexture.GetAddressOf());
+
+	ComPtr<ID3D11UnorderedAccessView> uav;
+	ComPtr<ID3D11ShaderResourceView> srv;
+
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+	uavDesc.Texture2D.MipSlice = 0;
+	device->CreateUnorderedAccessView(destTexture.Get(), &uavDesc, uav.GetAddressOf());
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+	srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	srvDesc.Texture2D.MostDetailedMip = 0;
+	device->CreateShaderResourceView(sourceTexture.Get(), &srvDesc, srv.GetAddressOf());
+
+	ComPtr<ID3D11DeviceContext> context;
+	device->GetImmediateContext(context.GetAddressOf());
+
+	auto uavList = uav.Get();
+	auto sampList = s_ss.Get();
+	auto shaderList = srv.Get();
+
+	std::vector<void*> emptyResource;
+	emptyResource.resize(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
+
+	std::vector<ID3D11ShaderResourceView*> oldSrv;
+	oldSrv.resize(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
+
+	context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, oldSrv.data());
+	context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, (ID3D11ShaderResourceView**)emptyResource.data());
+
+	context->CSSetUnorderedAccessViews(0, 1, &uavList, nullptr);
+	context->CSSetShader(s_cs.Get(), nullptr, 0);
+	context->CSSetSamplers(0, 1, &sampList);
+	context->CSSetShaderResources(0, 1, &shaderList);
+
+	context->Dispatch(currWidth / 8, currHeight / 8, 1);
+
+	shaderList = nullptr;
+	sampList = nullptr;
+	uavList = nullptr;
+	context->CSSetShaderResources(0, 1, &shaderList);
+	context->CSSetSamplers(0, 1, &sampList);
+	context->CSSetUnorderedAccessViews(0, 1, &uavList, nullptr);
+
+	context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, oldSrv.data());
+}
+
 static bool present_frame_texture()
 {
 	const auto is_presenting = render_pacer.CanRun();
 	if (is_presenting) {
 		SDL_RenderClear(sdl.renderer);
+#if 0
 		SDL_RenderCopy(sdl.renderer, sdl.texture.texture, nullptr, nullptr);
+#else
+		ShadeSDLDX11();
+		SDL_RenderCopy(sdl.renderer, s_effectTexture, nullptr, nullptr);
+#endif
 		SDL_RenderPresent(sdl.renderer);
 	}
 	render_pacer.Checkpoint();
@@ -4539,6 +4708,8 @@ int sdl_main(int argc, char *argv[])
 	sdl.initialized = true;
 	// Once initialized, ensure we clean up SDL for all exit conditions
 	atexit(QuitSDL);
+
+	//SDL_SetHint(SDL_HINT_RENDER_DIRECT3D11_DEBUG, "1");
 
 	LOG_MSG("SDL: version %d.%d.%d initialized (%s video and %s audio)",
 		SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL,
