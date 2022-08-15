@@ -178,20 +178,30 @@ static HalfFloat Convert32BitsToHalf(uint8_t r, uint8_t g, uint8_t b)
 	return res;
 }
 
-static HalfFloat Convert32BitsToHalf(uint32_t inValue)
+static HalfFloat Convert32BitsToHalf(uint32_t inValue, bool bgra = false)
 {
 	static uint16_t HFOne = fp16_ieee_from_fp32_value(1.0f);
 	static uint16_t HFZero = fp16_ieee_from_fp32_value(0.0f);
 
 	UNORMValue* val = (UNORMValue*)&inValue;
 	HalfFloat res;
-	res.r = UNORMToHalf(val->r);
-	res.g = UNORMToHalf(val->g);
-	res.b = UNORMToHalf(val->b);
+	if (bgra)
+	{
+		res.r = UNORMToHalf(val->b);
+		res.g = UNORMToHalf(val->g);
+		res.b = UNORMToHalf(val->r);
+	}
+	else
+	{
+		res.r = UNORMToHalf(val->r);
+		res.g = UNORMToHalf(val->g);
+		res.b = UNORMToHalf(val->b);
+	}
 	res.a = HFOne;
 
 	return res;
 }
+
 
 static void Check_Palette(void)
 {
@@ -603,7 +613,7 @@ static void HDR_16_to_64(const void* s)
 {
 #define SRCTYPE uint16_t
 #define PTYPE HalfFloat
-#define PMAKE(_VAL) Convert32BitsToHalf((((_VAL<<16)&0x00F80000)|((_VAL<<11)&0x00070000)|((_VAL<<13)&0x0000E000)|((_VAL>>3)&0x00001C00)|((_VAL<<7)&0x00000300)|((_VAL>>5)&0x000000F8)|((_VAL>>10)&0x00000007)))
+#define PMAKE(_VAL) Convert32BitsToHalf((((_VAL&(31<<11))<<8)|((_VAL&(63<<5))<<5)|((_VAL&0xE01F)<<3)|((_VAL&(3<<9))>>1)|((_VAL&(7<<2))>>2)), true)
 #define SCALERWIDTH		1
 #define SCALERHEIGHT	1
 #define PSIZE 8
