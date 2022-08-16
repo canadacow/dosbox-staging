@@ -316,13 +316,18 @@ struct TextureFormat
 
 typedef void (*SDL_D3D11_GetTexture_fn)(SDL_Texture* texture, void** outputTexture);
 
-static SDL_Texture* s_effectTexture = nullptr;
-static TextureFormat s_effectFormat{};
-static HMODULE s_SDLModule = NULL;
-static SDL_D3D11_GetTexture_fn s_GetTextureFn = nullptr;
-static Microsoft::WRL::ComPtr<ID3D11ComputeShader> s_cs = {};
-static Microsoft::WRL::ComPtr<ID3D11SamplerState> s_ss = {};
-static Microsoft::WRL::ComPtr<ID3D11Buffer> s_buffer = {};
+struct SDL_DX_Data
+{
+	SDL_Texture* effectTexture = nullptr;
+	TextureFormat effectFormat{};
+	HMODULE SDLModule = NULL;
+	SDL_D3D11_GetTexture_fn GetTextureFn = nullptr;
+	Microsoft::WRL::ComPtr<ID3D11ComputeShader>cs = {};
+	Microsoft::WRL::ComPtr<ID3D11SamplerState> ss = {};
+	Microsoft::WRL::ComPtr<ID3D11Buffer> buffer = {};
+};
+
+static std::unique_ptr<SDL_DX_Data> s_dx = {};
 
 extern "C" void SDL_CDROMQuit(void);
 static void QuitSDL()
@@ -1199,14 +1204,13 @@ static SDL_Window *SetWindowMode(SCREEN_TYPES screen_type,
 
 		if (screen_type == SCREEN_TEXTURE) {
 			if (sdl.renderer) {
-				s_ss.Reset();
-				s_cs.Reset();
-				s_buffer.Reset();
+				s_dx.reset();
 				SDL_DestroyRenderer(sdl.renderer);
 				sdl.renderer = nullptr;
 			}
 
 			assert(sdl.renderer == nullptr);
+			s_dx = std::make_unique<SDL_DX_Data>();
 			sdl.renderer = SDL_CreateRenderer(sdl.window, -1, 0);
 			if (!sdl.renderer) {
 				LOG_ERR("SDL: Failed to create renderer: %s",
@@ -2407,12 +2411,20 @@ RWTexture2D<float4> OutText : register(u0);
 Texture2D<float4> SrcText : register(t0);
 SamplerState BilinearClamp : register(s0);
 
+cbuffer CS_CONSTANT_BUFFER : register(b0)
+{
+	int scanlineStart;
+	int scanlineEnd;
+	int frameNumber;
+    int dummy;
+};
+
 #define hardScan -8.0
 #define hardPix -3.0
 #define warpX 0.031
 #define warpY 0.041
-#define maskDark 0.5
-#define maskLight 1.5
+#define maskDark 0.0
+//#define maskLight 2.5
 #define scaleInLinearGamma 1
 #define shadowMask 4
 #define brightboost 1
@@ -2536,6 +2548,13 @@ float2 Warp(float2 pos){
 float3 Mask(float2 pos){
   float3 mask=float3(maskDark,maskDark,maskDark);
 
+  float maskLight = 2.35;
+  
+  if((frameNumber % 2) == 0)
+  {
+	maskLight = 2.45;
+  }
+
   // Very compressed TV style shadow mask.
   if (shadowMask == 1) {
     float mask_line = maskLight;
@@ -2582,14 +2601,6 @@ float3 Mask(float2 pos){
 
   return mask;
 }
-
-cbuffer CS_CONSTANT_BUFFER : register(b0)
-{
-	int scanlineStart;
-	int scanlineEnd;
-	int frameNumber;
-    int dummy;
-};
 
 float4 crt_lottes(float2 texture_size, float2 video_size, float2 output_size, float2 tex)
 {
@@ -2667,15 +2678,15 @@ static void ShadeSDLDX11()
 	int currWidth, currHeight;
 	SDL_GetWindowSize(sdl.window, &currWidth, &currHeight);
 
-	if (s_effectTexture)
+	if (s_dx->effectTexture)
 	{
-		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.w != currWidth);
-		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.h != currHeight);
-		needsNewEffectTexture = needsNewEffectTexture || (s_effectFormat.format != sdl.texture.pixelFormat->format);
+		needsNewEffectTexture = needsNewEffectTexture || (s_dx->effectFormat.w != currWidth);
+		needsNewEffectTexture = needsNewEffectTexture || (s_dx->effectFormat.h != currHeight);
+		needsNewEffectTexture = needsNewEffectTexture || (s_dx->effectFormat.format != sdl.texture.pixelFormat->format);
 
 		if (needsNewEffectTexture)
 		{
-			SDL_DestroyTexture(s_effectTexture);
+			SDL_DestroyTexture(s_dx->effectTexture);
 		}
 	}
 	else
@@ -2685,18 +2696,18 @@ static void ShadeSDLDX11()
 
 	if (needsNewEffectTexture)
 	{
-		s_effectTexture = SDL_CreateTexture(sdl.renderer, sdl.texture.pixelFormat->format, SDL_TEXTUREACCESS_TARGET,
+		s_dx->effectTexture = SDL_CreateTexture(sdl.renderer, sdl.texture.pixelFormat->format, SDL_TEXTUREACCESS_TARGET,
 											currWidth, currHeight);
 
-		s_effectFormat.w = currWidth;
-		s_effectFormat.h = currHeight;
-		s_effectFormat.format = sdl.texture.pixelFormat->format;
+		s_dx->effectFormat.w = currWidth;
+		s_dx->effectFormat.h = currHeight;
+		s_dx->effectFormat.format = sdl.texture.pixelFormat->format;
 	}
 
-	if (s_SDLModule == nullptr)
+	if (s_dx->SDLModule == nullptr)
 	{
-		s_SDLModule = LoadLibraryA("SDL2.DLL");
-		s_GetTextureFn = (SDL_D3D11_GetTexture_fn)GetProcAddress(s_SDLModule, "SDL_D3D11_GetTexture");
+		s_dx->SDLModule = LoadLibraryA("SDL2.DLL");
+		s_dx->GetTextureFn = (SDL_D3D11_GetTexture_fn)GetProcAddress(s_dx->SDLModule, "SDL_D3D11_GetTexture");
 
 		ComPtr<ID3DBlob> codeBlob;
 		ComPtr<ID3DBlob> errorBlob;
@@ -2704,7 +2715,7 @@ static void ShadeSDLDX11()
 		//D3DCompile(computeShader, strlen(computeShader), "computeShader", nullptr, nullptr, "main", "cs_5_0", 0, 0, codeBlob.GetAddressOf(), errorBlob.GetAddressOf());
 		D3DCompile(crt_lottes, strlen(crt_lottes), "computeShader", nullptr, nullptr, "main", "cs_5_0", 0, 0, codeBlob.GetAddressOf(), errorBlob.GetAddressOf());
 		
-		device->CreateComputeShader(codeBlob->GetBufferPointer(), codeBlob->GetBufferSize(), nullptr, s_cs.GetAddressOf());
+		device->CreateComputeShader(codeBlob->GetBufferPointer(), codeBlob->GetBufferSize(), nullptr, s_dx->cs.GetAddressOf());
 
 		D3D11_SAMPLER_DESC sampDesc{};
 		sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -2720,21 +2731,21 @@ static void ShadeSDLDX11()
 		sampDesc.BorderColor[3] = 0.0f;
 		sampDesc.MinLOD = -FLT_MAX;
 		sampDesc.MaxLOD = FLT_MAX;
-		device->CreateSamplerState(&sampDesc, s_ss.GetAddressOf());
+		device->CreateSamplerState(&sampDesc, s_dx->ss.GetAddressOf());
 
 		D3D11_BUFFER_DESC bufDesc{};
 		bufDesc.ByteWidth = 256;
 		bufDesc.Usage = D3D11_USAGE_DYNAMIC;
 		bufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 		bufDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		device->CreateBuffer(&bufDesc, nullptr, s_buffer.GetAddressOf());
+		device->CreateBuffer(&bufDesc, nullptr, s_dx->buffer.GetAddressOf());
 	}
 
 	ComPtr<ID3D11Texture2D> sourceTexture;
 	ComPtr<ID3D11Texture2D> destTexture;
 
-	s_GetTextureFn(sdl.texture.texture, (void**)sourceTexture.GetAddressOf());
-	s_GetTextureFn(s_effectTexture, (void**)destTexture.GetAddressOf());
+	s_dx->GetTextureFn(sdl.texture.texture, (void**)sourceTexture.GetAddressOf());
+	s_dx->GetTextureFn(s_dx->effectTexture, (void**)destTexture.GetAddressOf());
 
 	ComPtr<ID3D11UnorderedAccessView> uav;
 	ComPtr<ID3D11ShaderResourceView> srv;
@@ -2756,9 +2767,9 @@ static void ShadeSDLDX11()
 	device->GetImmediateContext(context.GetAddressOf());
 
 	auto uavList = uav.Get();
-	auto sampList = s_ss.Get();
+	auto sampList = s_dx->ss.Get();
 	auto shaderList = srv.Get();
-	auto bufList = s_buffer.Get();
+	auto bufList = s_dx->buffer.Get();
 
 	struct BuffStruct
 	{
@@ -2769,14 +2780,14 @@ static void ShadeSDLDX11()
 	};
 
 	D3D11_MAPPED_SUBRESOURCE mapping;
-	context->Map(s_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping);
+	context->Map(s_dx->buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping);
 
 	BuffStruct* bs = (BuffStruct*)mapping.pData;
 
 	bs->scanlineStart = 0;
 	bs->scanlineEnd = 0;
 	bs->frameNumber = frameNumber;
-	context->Unmap(s_buffer.Get(), 0);
+	context->Unmap(s_dx->buffer.Get(), 0);
 
 	std::vector<void*> emptyResource;
 	emptyResource.resize(D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
@@ -2788,7 +2799,7 @@ static void ShadeSDLDX11()
 	context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, (ID3D11ShaderResourceView**)emptyResource.data());
 
 	context->CSSetUnorderedAccessViews(0, 1, &uavList, nullptr);
-	context->CSSetShader(s_cs.Get(), nullptr, 0);
+	context->CSSetShader(s_dx->cs.Get(), nullptr, 0);
 	context->CSSetSamplers(0, 1, &sampList);
 	context->CSSetShaderResources(0, 1, &shaderList);
 	context->CSSetConstantBuffers(0, 1, &bufList);
@@ -2818,7 +2829,7 @@ static bool present_frame_texture()
 		SDL_RenderCopy(sdl.renderer, sdl.texture.texture, nullptr, nullptr);
 #else
 		ShadeSDLDX11();
-		SDL_RenderCopy(sdl.renderer, s_effectTexture, nullptr, nullptr);
+		SDL_RenderCopy(sdl.renderer, s_dx->effectTexture, nullptr, nullptr);
 #endif
 		SDL_RenderPresent(sdl.renderer);
 	}
@@ -2997,6 +3008,7 @@ static void GUI_ShutDown(Section *)
 
 	CleanupSDLResources();
 	if (sdl.renderer) {
+		s_dx.reset();
 		SDL_DestroyRenderer(sdl.renderer);
 		sdl.renderer = nullptr;
 	}
@@ -4870,6 +4882,8 @@ int sdl_main(int argc, char *argv[])
 {
 	CommandLine com_line(argc, argv);
 	control = std::make_unique<Config>(&com_line);
+
+	s_dx = std::make_unique<SDL_DX_Data>();
 
 	if (control->cmdline->FindExist("--version") ||
 	    control->cmdline->FindExist("-version") ||

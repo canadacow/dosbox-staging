@@ -736,7 +736,7 @@ static void HDR_32_to_64(const void* s)
 {
 #define SRCTYPE uint32_t
 #define PTYPE HalfFloat
-#define PMAKE(_VAL) Convert32BitsToHalf(_VAL)
+#define PMAKE(_VAL) Convert32BitsToHalf(_VAL, true)
 #define SCALERWIDTH		1
 #define SCALERHEIGHT	1
 #define PSIZE 8
