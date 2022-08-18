@@ -323,7 +323,7 @@ struct SDL_DX_Data
 	HMODULE SDLModule = NULL;
 	SDL_D3D11_GetTexture_fn GetTextureFn = nullptr;
 	Microsoft::WRL::ComPtr<ID3D11ComputeShader>cs = {};
-	Microsoft::WRL::ComPtr<ID3D11SamplerState> ss = {};
+	Microsoft::WRL::ComPtr<ID3D11SamplerState> ss[16] = {};
 	Microsoft::WRL::ComPtr<ID3D11Buffer> buffer = {};
 };
 
@@ -2663,6 +2663,8 @@ void main( uint3 DTid : SV_DispatchThreadID )
 }
 )";
 
+extern float UNORMToFloat(uint8_t unorm);
+
 static void ShadeSDLDX11()
 {
 	using namespace Microsoft::WRL;
@@ -2717,21 +2719,30 @@ static void ShadeSDLDX11()
 		
 		device->CreateComputeShader(codeBlob->GetBufferPointer(), codeBlob->GetBufferSize(), nullptr, s_dx->cs.GetAddressOf());
 
-		D3D11_SAMPLER_DESC sampDesc{};
-		sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-		sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
-		sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
-		sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
-		sampDesc.MipLODBias = 0;
-		sampDesc.MaxAnisotropy = 1;
-		sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-		sampDesc.BorderColor[0] = 0.0f;
-		sampDesc.BorderColor[1] = 0.0f;
-		sampDesc.BorderColor[2] = 0.0f;
-		sampDesc.BorderColor[3] = 0.0f;
-		sampDesc.MinLOD = -FLT_MAX;
-		sampDesc.MaxLOD = FLT_MAX;
-		device->CreateSamplerState(&sampDesc, s_dx->ss.GetAddressOf());
+		for (int bg = 0; bg < 16; ++bg)
+		{
+			D3D11_SAMPLER_DESC sampDesc{};
+			sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+			sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_BORDER;
+			sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_BORDER;
+			sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
+			sampDesc.MipLODBias = 0;
+			sampDesc.MaxAnisotropy = 1;
+			sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+
+			uint8_t r = render.pal.rgb[bg].red;
+			uint8_t g = render.pal.rgb[bg].green;
+			uint8_t b = render.pal.rgb[bg].blue;
+
+			sampDesc.BorderColor[0] = UNORMToFloat(r);
+			sampDesc.BorderColor[1] = UNORMToFloat(g);
+			sampDesc.BorderColor[2] = UNORMToFloat(b);
+			sampDesc.BorderColor[3] = UNORMToFloat(255);
+
+			sampDesc.MinLOD = -FLT_MAX;
+			sampDesc.MaxLOD = FLT_MAX;
+			device->CreateSamplerState(&sampDesc, s_dx->ss[bg].GetAddressOf());
+		}
 
 		D3D11_BUFFER_DESC bufDesc{};
 		bufDesc.ByteWidth = 256;
@@ -2767,7 +2778,7 @@ static void ShadeSDLDX11()
 	device->GetImmediateContext(context.GetAddressOf());
 
 	auto uavList = uav.Get();
-	auto sampList = s_dx->ss.Get();
+	auto sampList = s_dx->ss[vga.attr.overscan_color].Get();
 	auto shaderList = srv.Get();
 	auto bufList = s_dx->buffer.Get();
 

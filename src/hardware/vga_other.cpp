@@ -794,6 +794,9 @@ static void write_cga_color_select(uint8_t val)
 		vga.tandy.border_color = val & 0xf;
 		vga.attr.overscan_color = 0;
 		break;
+	case M_TANDY_TEXT:
+		vga.attr.overscan_color = val & 0xf;
+		break;
 	default: //Else unhandled values warning
 		break;
 	}

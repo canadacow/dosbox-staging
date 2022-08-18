@@ -852,6 +852,31 @@ public:
 	}
 };
 
+class VGA_CGATEXT_PageHandler final : public PageHandler {
+public:
+	VGA_CGATEXT_PageHandler() {
+		flags = PFLAG_NOCODE;
+	}
+	uint8_t readb(PhysPt addr) {
+		addr = PAGING_GetPhysicalAddress(addr) & 0x3FFF;
+		return vga.tandy.mem_base[addr];
+	}
+	void writeb(PhysPt addr, uint8_t val) {
+		/* NTS: We can't use PIC_FullIndex() exclusively because it's not precise enough
+			*      with respect to when DOSBox CPU emulation is writing. We have to use other
+			*      variables like CPU_Cycles to gain additional precision */
+		double timeInFrame = PIC_FullIndex() - vga.draw.delay.framestart;
+		double timeInLine = fmod(timeInFrame, vga.draw.delay.htotal);
+
+		/* we're in active area. which column should the snow show up on? */
+		uint32_t x = (uint32_t)((timeInLine * 80) / vga.draw.delay.hblkstart);
+		if ((unsigned)x < 80) vga.draw.cga_snow[x] = val;
+
+		addr = PAGING_GetPhysicalAddress(addr) & 0x3FFF;
+		vga.tandy.mem_base[addr] = val;
+	}
+};
+
 class VGA_Empty_Handler final : public PageHandler {
 public:
 	VGA_Empty_Handler() {
@@ -887,6 +912,7 @@ static struct vg {
 	VGA_LFBChanges_Handler lfbchanges = {};
 	VGA_MMIO_Handler mmio = {};
 	VGA_Empty_Handler empty = {};
+	VGA_CGATEXT_PageHandler	cgatext = {};
 } vgaph;
 
 void VGA_ChangedBank(void) {
@@ -906,6 +932,11 @@ void VGA_SetupHandlers(void) {
 	PageHandler *newHandler;
 	switch (machine) {
 	case MCH_CGA:
+		if (vga.mode == M_TEXT || vga.mode == M_TANDY_TEXT)
+			MEM_SetPageHandler(VGA_PAGE_B8, 8, &vgaph.cgatext);
+		else
+			MEM_SetPageHandler(VGA_PAGE_B8, 8, &vgaph.pcjr);
+		goto range_done;
 	case MCH_PCJR:
 		MEM_SetPageHandler( VGA_PAGE_A0, 16, &vgaph.empty );
 		MEM_SetPageHandler( VGA_PAGE_B0, 8, &vgaph.empty );

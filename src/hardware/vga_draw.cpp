@@ -306,6 +306,60 @@ static uint8_t * VGA_Draw_Changes_Line(Bitu vidstart, Bitu line) {
 
 #endif
 
+template <const bool snow> static uint8_t* CGA_COMMON_TEXT_Draw_Line(Bitu vidstart, Bitu line) {
+	Bits font_addr;
+	uint32_t* draw = (uint32_t*)TempLine;
+	const uint8_t* vidmem = VGA_Text_Memwrap(vidstart);
+
+	if (snow) {
+		/* HACK: our code does not have render control during VBLANK, zero our
+		 *       noise bits on the first scanline */
+		if (line == 0)
+			memset(vga.draw.cga_snow, 0, sizeof(vga.draw.cga_snow));
+	}
+
+	for (Bitu cx = 0; cx < vga.draw.blocks; cx++) {
+		Bitu chr, col;
+		chr = vidmem[cx * 2];
+		col = vidmem[cx * 2 + 1];
+		if (snow && (cx & 1) == 0 && cx <= 78) {
+			/* Trixter's "CGA test" program and reference video seems to suggest
+			 * to me that the CGA "snow" might contain the value written by the CPU. */
+			if (vga.draw.cga_snow[cx] != 0)
+				chr = vga.draw.cga_snow[cx];
+			if (vga.draw.cga_snow[cx + 1] != 0)
+				col = vga.draw.cga_snow[cx + 1];
+		}
+
+		Bitu font = vga.draw.font_tables[(col >> 3) & 1][chr * 32 + line];
+		uint32_t mask1 = TXT_Font_Table[font >> 4] & FontMask[col >> 7];
+		uint32_t mask2 = TXT_Font_Table[font & 0xf] & FontMask[col >> 7];
+		uint32_t fg = TXT_FG_Table[col & 0xf];
+		uint32_t bg = TXT_BG_Table[col >> 4];
+		*draw++ = (fg & mask1) | (bg & ~mask1);
+		*draw++ = (fg & mask2) | (bg & ~mask2);
+	}
+
+	if (snow)
+		memset(vga.draw.cga_snow, 0, sizeof(vga.draw.cga_snow));
+
+	if (!vga.draw.cursor.enabled || !(vga.draw.cursor.count & 0x8)) goto skip_cursor;
+	font_addr = ((Bits)vga.draw.cursor.address - (Bits)vidstart) >> 1ll;
+	if (font_addr >= 0 && font_addr < (Bits)vga.draw.blocks) {
+		if (line < vga.draw.cursor.sline) goto skip_cursor;
+		if (line > vga.draw.cursor.eline) goto skip_cursor;
+		draw = (uint32_t*)&TempLine[(unsigned long)font_addr * 8ul];
+		uint32_t att = TXT_FG_Table[vga.tandy.draw_base[vga.draw.cursor.address + 1ul] & 0xfu];
+		*draw++ = att; *draw++ = att;
+	}
+skip_cursor:
+	return TempLine;
+}
+
+static uint8_t* VGA_CGASNOW_TEXT_Draw_Line(Bitu vidstart, Bitu line) {
+	return CGA_COMMON_TEXT_Draw_Line<true>(vidstart, line);
+}
+
 static uint8_t * VGA_Draw_Linear_Line(Bitu vidstart, Bitu /*line*/) {
 	Bitu offset = vidstart & vga.draw.linear_mask;
 	uint8_t* ret = &vga.draw.linear_base[offset];
@@ -1757,7 +1811,10 @@ void VGA_SetupDrawing(uint32_t /*val*/)
 		doubleheight=true;
 		vga.draw.blocks=width;
 		width<<=3;
-		VGA_DrawLine=VGA_TEXT_Draw_Line;
+		if (machine == MCH_CGA /*&& !doublewidth*/ && true /* enableCGASnow */ && (vga.tandy.mode_control & 1)/*80-column mode*/)
+			VGA_DrawLine = VGA_CGASNOW_TEXT_Draw_Line; /* Alternate version that emulates CGA snow */
+		else
+			VGA_DrawLine=VGA_TEXT_Draw_Line;
 		break;
 	case M_CGA_TEXT_COMPOSITE:
 		aspect_ratio = 1.2;

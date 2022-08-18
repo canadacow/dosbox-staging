@@ -44,8 +44,6 @@
 
 #include "render_scalers.h"
 
-#pragma optimize("", off)
-
 #include "fp16.h"
 
 Render_t render;
@@ -133,7 +131,7 @@ static float sRgbToLinear(uint8_t bval)
 	return pow(val, 2.2);
 }
 
-static float unormToFloat(uint8_t bval)
+static float simpleUnormToFloat(uint8_t bval)
 {
 	return ((float)bval / 255.0f);
 }
@@ -158,10 +156,14 @@ static float sRgbToScRgb(float val)
 	}
 }
 
+float UNORMToFloat(uint8_t unorm)
+{
+	return sRgbToScRgb(simpleUnormToFloat(unorm)) * s_SDRWhiteLevel;
+}
+
 static uint16_t UNORMToHalf(uint8_t unorm)
 {
-	float val = sRgbToScRgb(unormToFloat(unorm)) * s_SDRWhiteLevel;
-	return fp16_ieee_from_fp32_value(val);
+	return fp16_ieee_from_fp32_value(UNORMToFloat(unorm));
 }
 
 static HalfFloat Convert32BitsToHalf(uint8_t r, uint8_t g, uint8_t b)

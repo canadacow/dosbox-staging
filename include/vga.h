@@ -208,6 +208,7 @@ struct VGA_Draw {
 	} cursor = {};
 	Drawmode mode = {};
 	bool vret_triggered = false;
+	uint8_t cga_snow[80] = {};
 };
 
 struct VGA_HWCURSOR {
