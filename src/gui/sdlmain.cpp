@@ -2423,17 +2423,19 @@ cbuffer CS_CONSTANT_BUFFER : register(b0)
 #define hardPix -3.0
 #define warpX 0.031
 #define warpY 0.041
-#define maskDark 0.0
-//#define maskLight 2.5
+// maskDark was 0.5 in sRGB space
+#define maskDark 1.75
+// maskLight was 1.5 in sRGB space
+#define maskLight  5.25
 #define scaleInLinearGamma 1
 #define shadowMask 4
-#define brightboost 1
+//#define brightboost 1
 #define hardBloomScan -2.0
 #define hardBloomPix -1.5
-#define bloomAmount 4.0/16.0
+#define bloomAmount 1.0/16.0
 #define shape 2.0
 
-#define DO_BLOOM 1
+//#define DO_BLOOM 1
 
 #define warp float2(warpX,warpY)
 
@@ -2441,6 +2443,14 @@ cbuffer CS_CONSTANT_BUFFER : register(b0)
 // Also zero's off screen.
 float3 Fetch(float2 pos, float2 off, float2 texture_size){
   pos=(floor(pos*texture_size.xy+off)+float2(0.5,0.5))/texture_size.xy;
+
+  float brightboost = 1.0;
+
+  if((frameNumber % 2) == 0)
+  {
+	brightboost = 0.97;
+  }
+
   return brightboost * SrcText.SampleLevel(BilinearClamp, pos, 0).rgb;
 }
 
@@ -2547,13 +2557,6 @@ float2 Warp(float2 pos){
 // Shadow mask 
 float3 Mask(float2 pos){
   float3 mask=float3(maskDark,maskDark,maskDark);
-
-  float maskLight = 2.35;
-  
-  if((frameNumber % 2) == 0)
-  {
-	maskLight = 2.45;
-  }
 
   // Very compressed TV style shadow mask.
   if (shadowMask == 1) {
