@@ -2413,8 +2413,8 @@ SamplerState BilinearClamp : register(s0);
 
 cbuffer CS_CONSTANT_BUFFER : register(b0)
 {
-	int scanlineStart;
-	int scanlineEnd;
+	float scaleX;
+	float scaleY;
 	int frameNumber;
     int dummy;
 };
@@ -2424,8 +2424,10 @@ cbuffer CS_CONSTANT_BUFFER : register(b0)
 #define warpX 0.031
 #define warpY 0.041
 // maskDark was 0.5 in sRGB space
+//#define maskDark 0.5
 #define maskDark 1.75
 // maskLight was 1.5 in sRGB space
+//#define maskLight  1.5
 #define maskLight  5.25
 #define scaleInLinearGamma 1
 #define shadowMask 4
@@ -2616,12 +2618,6 @@ float4 crt_lottes(float2 texture_size, float2 video_size, float2 output_size, fl
   outColor.rgb+=Bloom(pos, texture_size)*bloomAmount;
 #endif
 
-  int2 scanline = pos * texture_size;
-  if(scanline.y > scanlineStart && scanline.y < scanlineEnd)
-  {
-      outColor.rgb *= 4.0;
-  }
-
   if(shadowMask)
     outColor.rgb*=Mask(floor(tex.xy*(texture_size.xy/video_size.xy)*output_size.xy)+float2(0.5,0.5));
 
@@ -2638,9 +2634,17 @@ void main( uint3 DTid : SV_DispatchThreadID )
 	SrcText.GetDimensions(InTexDims.x, InTexDims.y);
     
 	float2 TexelSize = 1.0 / OutTexDims;
+	
     float2 UV = TexelSize * (DTid.xy + 0.5);
+
+    float2 VideoSize = InTexDims;
+
+    VideoSize.x *= scaleX;
+	UV.x *= scaleX;
+    VideoSize.y *= scaleY;
+	UV.y *= scaleY;
     
-    float4 Src1 = crt_lottes(InTexDims, InTexDims, OutTexDims, UV);
+    float4 Src1 = crt_lottes(InTexDims, VideoSize, OutTexDims, UV);
 
     OutText[DTid.xy] = Src1;
 }
@@ -2787,8 +2791,8 @@ static void ShadeSDLDX11()
 
 	struct BuffStruct
 	{
-		uint32_t scanlineStart;
-		uint32_t scanlineEnd;
+		float scaleX;
+		float scaleY;
 		uint32_t frameNumber;
 		uint32_t dummy;
 	};
@@ -2798,8 +2802,8 @@ static void ShadeSDLDX11()
 
 	BuffStruct* bs = (BuffStruct*)mapping.pData;
 
-	bs->scanlineStart = 0;
-	bs->scanlineEnd = 0;
+	bs->scaleX = render.src.dblw ? 0.5f : 1.0f;
+	bs->scaleY = render.src.dblh ? 0.5f : 1.0f;
 	bs->frameNumber = frameNumber;
 	context->Unmap(s_dx->buffer.Get(), 0);
 
@@ -2818,7 +2822,7 @@ static void ShadeSDLDX11()
 	context->CSSetShaderResources(0, 1, &shaderList);
 	context->CSSetConstantBuffers(0, 1, &bufList);
 
-	context->Dispatch(currWidth / 8, currHeight / 8, 1);
+	context->Dispatch((currWidth / 8) + 1, (currHeight / 8) + 1, 1);
 
 	shaderList = nullptr;
 	sampList = nullptr;
